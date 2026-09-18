@@ -13,6 +13,7 @@ struct CODEC2 *c2 = NULL;
 int samplesPerFrame = 0;
 int bytesPerFrame = 0;
 int packetSize = 0;
+int radioPacketSize = 0;   // ✅ НОВОЕ: размер радиопакета
 
 int16_t*  audioBuffer = NULL;    
 uint8_t*  txPacketBuffer = NULL; 
@@ -22,10 +23,20 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
 // ============================================
+// ADC DMA DOUBLE BUFFER
+// ============================================
+#define ADC_BLOCK_SAMPLES 160
+
+int16_t adcDmaBufferA[ADC_BLOCK_SAMPLES];
+int16_t adcDmaBufferB[ADC_BLOCK_SAMPLES];
+
+volatile uint8_t currentDmaBuffer = 0;
+volatile uint8_t readyBuffer = 0xFF;
+
+// ============================================
 // MULTI-BUFFER BLOCK QUEUE
 // ============================================
-#define NUM_ADC_BLOCKS 4
-#define ADC_BLOCK_SAMPLES 320
+#define NUM_ADC_BLOCKS 3
 
 struct AdcBlock {
     int16_t data[ADC_BLOCK_SAMPLES];
@@ -39,23 +50,12 @@ volatile uint8_t blockReadIdx = 0;
 volatile uint8_t blocksAvailable = 0;
 volatile uint32_t blockSequence = 0;
 volatile uint32_t blocksLost = 0;
-volatile bool adcBufferReady = false;
-
-// ============================================
-// RX БУФЕР
-// ============================================
-#define RX_RING_SIZE 1280
-int16_t rxRingBuffer[RX_RING_SIZE];
-volatile int rxWriteIdx = 0;
-volatile int rxReadIdx = 0;
-volatile int rxBufferedSamples = 0;
-volatile uint32_t rxUnderrunCnt = 0;
-volatile uint32_t rxOverrunCnt = 0;
 
 // ============================================
 // TX PACKET FIFO
 // ============================================
 #define TX_QUEUE_SIZE 4
+
 struct TxPacket {
     uint8_t data[32];
     uint8_t len;
@@ -67,45 +67,10 @@ volatile uint8_t txCount = 0;
 volatile uint32_t txLost = 0;
 
 // ============================================
-// RX PACKET QUEUE
-// ============================================
-#define RX_QUEUE_SIZE 4
-struct RxPacket {
-    uint8_t data[32];
-    uint8_t len;
-    uint16_t sequence;
-    uint32_t timestamp;
-};
-RxPacket rxQueue[RX_QUEUE_SIZE];
-volatile uint8_t rxHead = 0;
-volatile uint8_t rxTail = 0;
-volatile uint8_t rxCount = 0;
-volatile uint32_t rxQueueLost = 0;
-
-// ============================================
-// SEQUENCE + REORDER
-// ============================================
-#define REORDER_SIZE 8
-#define REORDER_MASK (REORDER_SIZE - 1)
-
-struct ReorderSlot {
-    uint8_t data[32];
-    uint8_t len;
-    bool ready;
-    uint32_t timestamp;
-};
-
-ReorderSlot reorderBuffer[REORDER_SIZE];
-volatile uint16_t reorderNextSeq = 0;
-volatile uint16_t txSequence = 0;
-volatile uint16_t rxSequence = 0;  // ← НОВЫЙ счетчик для RX
-volatile uint32_t reorderLost = 0;
-
-// ============================================
 // JITTER BUFFER
 // ============================================
-#define PCM_JITTER_SIZE 1280
-#define PCM_START_THRESHOLD 640
+#define PCM_JITTER_SIZE 4096
+#define PCM_START_THRESHOLD 512
 
 int16_t pcmJitter[PCM_JITTER_SIZE];
 volatile uint16_t pcmWrite = 0;
@@ -115,6 +80,14 @@ volatile uint32_t pcmUnderrun = 0;
 volatile uint32_t pcmOverrun = 0;
 
 // ============================================
+// PLC (Packet Loss Concealment)
+// ============================================
+#define PLC_FRAME_SIZE 160
+static int16_t lastFrame[PLC_FRAME_SIZE];
+static float plcFade = 1.0;
+static bool lastFrameValid = false;
+
+// ============================================
 // ПРОТОТИПЫ
 // ============================================
 void onDio1Interrupt(void); 
@@ -122,9 +95,12 @@ void rxPwmISR(void);
 void handleVoiceTransmit(void);
 void processIncomingPacket(void); 
 void initHardwareAdcTimerDriven(void);
-void processAdcBlock(AdcBlock* block);
+void processAdcBlock(int16_t* data, uint32_t size);
 void processTransmit(void);
 void printDiag(void);
+void initPwmAudio(void);
+void plcGenerate(void);
+void handleDmaReadyBlocks(void);
 
 // ============================================
 // JITTER FUNCTIONS
@@ -134,7 +110,7 @@ inline bool pcmPush(int16_t sample) {
     if (next >= PCM_JITTER_SIZE) next = 0;
     if (next == pcmRead) {
         pcmOverrun++;
-        return false;
+        pcmRead = (pcmRead + 1) % PCM_JITTER_SIZE;
     }
     pcmJitter[pcmWrite] = sample;
     pcmWrite = next;
@@ -158,56 +134,30 @@ inline uint16_t pcmAvailable() {
 }
 
 // ============================================
-// RX QUEUE FUNCTIONS
+// PLC FUNCTIONS
 // ============================================
-bool rxQueuePush(uint8_t* data, uint8_t len, uint16_t seq) {
-    if (rxCount >= RX_QUEUE_SIZE) {
-        rxQueueLost++;
-        return false;
+void plcGenerate() {
+    if (!lastFrameValid) {
+        for (int i = 0; i < PLC_FRAME_SIZE; i++) {
+            pcmPush(0);
+        }
+        return;
     }
-    memcpy(rxQueue[rxTail].data, data, len);
-    rxQueue[rxTail].len = len;
-    rxQueue[rxTail].sequence = seq;
-    rxQueue[rxTail].timestamp = micros();
-    rxTail = (rxTail + 1) % RX_QUEUE_SIZE;
-    rxCount++;
-    return true;
-}
-
-bool rxQueuePop(uint8_t* data, uint8_t* len, uint16_t* seq) {
-    if (rxCount == 0) return false;
-    memcpy(data, rxQueue[rxHead].data, rxQueue[rxHead].len);
-    *len = rxQueue[rxHead].len;
-    *seq = rxQueue[rxHead].sequence;
-    rxHead = (rxHead + 1) % RX_QUEUE_SIZE;
-    rxCount--;
-    return true;
-}
-
-// ============================================
-// REORDER FUNCTIONS
-// ============================================
-bool reorderPush(uint8_t* data, uint8_t len, uint16_t seq) {
-    uint16_t slot = seq & REORDER_MASK;
-    if (reorderBuffer[slot].ready) {
-        reorderLost++;
-        return false;
+    plcFade *= 0.85;
+    if (plcFade < 0.1) plcFade = 0.1;
+    for (int i = 0; i < PLC_FRAME_SIZE; i++) {
+        int32_t sample = (int32_t)lastFrame[i] * plcFade;
+        if (sample > 32767) sample = 32767;
+        if (sample < -32768) sample = -32768;
+        pcmPush((int16_t)sample);
     }
-    memcpy(reorderBuffer[slot].data, data, len);
-    reorderBuffer[slot].len = len;
-    reorderBuffer[slot].ready = true;
-    reorderBuffer[slot].timestamp = micros();
-    return true;
 }
 
-bool reorderPop(uint8_t* data, uint8_t* len) {
-    uint16_t slot = reorderNextSeq & REORDER_MASK;
-    if (!reorderBuffer[slot].ready) return false;
-    memcpy(data, reorderBuffer[slot].data, reorderBuffer[slot].len);
-    *len = reorderBuffer[slot].len;
-    reorderBuffer[slot].ready = false;
-    reorderNextSeq++;
-    return true;
+void plcSaveFrame(int16_t* data, uint32_t size) {
+    if (data == NULL || size > PLC_FRAME_SIZE) return;
+    memcpy(lastFrame, data, size * sizeof(int16_t));
+    lastFrameValid = true;
+    plcFade = 1.0;
 }
 
 // ============================================
@@ -234,6 +184,9 @@ bool txQueuePop(uint8_t* data, uint8_t* len) {
     return true;
 }
 
+// ============================================
+// ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+// ============================================
 volatile bool radioActionDone = false; 
 volatile bool radioActionInProgress = false; 
 
@@ -250,18 +203,10 @@ uint32_t rssiReadCount = 0;
 volatile uint32_t framesEncoded = 0;
 volatile uint32_t packetsSent = 0;
 volatile uint32_t adcReadCount = 0;
-uint32_t lastDebugPrint = 0;
 
 volatile uint32_t rxPacketsReceived = 0;
 volatile uint32_t rxPacketsFailed = 0;
-volatile uint32_t lastPacketTime = 0;
-volatile uint32_t rxIntervalMax = 0;
-volatile uint32_t rxIntervalMin = 99999;
-volatile uint32_t bufferEmptyEvents = 0;
 
-// ============================================
-// ДИАГНОСТИЧЕСКИЕ СЧЁТЧИКИ
-// ============================================
 volatile uint32_t txPacketCnt = 0;
 volatile uint32_t txPacketLost = 0;
 volatile uint32_t dmaBlockCnt = 0;
@@ -269,59 +214,79 @@ volatile uint32_t dmaIrqCount = 0;
 
 HardwareTimer *rxPwmTimer8k = NULL;
 
+volatile uint32_t txQueueFullCount = 0;
+volatile uint32_t txStartTransmitCalls = 0;
+volatile uint32_t txStartTransmitSuccess = 0;
+volatile uint32_t txStartTransmitFail = 0;
+volatile uint32_t txDio1Interrupts = 0;
+volatile uint32_t txTimeoutResets = 0;
+
+volatile uint16_t txSequence = 0;   // ✅ НОВОЕ: счетчик sequence для TX
+
 // ============================================
-// ВЕКТОР ПРЕРЫВАНИЯ DMA
+// DMA ISR
 // ============================================
 extern "C" void DMA2_Stream0_IRQHandler(void) {
     HAL_DMA_IRQHandler(&hdma_adc1);
 }
 
-// ============================================
-// ISR — ТОЛЬКО ФЛАГ
-// ============================================
 extern "C" void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
     if (hadc->Instance == ADC1) {
-        if (isTransmitting) {
-            adcBufferReady = true;
-            dmaBlockCnt++;
+        if (currentDmaBuffer == 0) {
+            readyBuffer = 0;
+            HAL_ADC_Stop_DMA(hadc);
+            HAL_ADC_Start_DMA(hadc, (uint32_t*)adcDmaBufferB, ADC_BLOCK_SAMPLES);
+            currentDmaBuffer = 1;
+        } else {
+            readyBuffer = 1;
+            HAL_ADC_Stop_DMA(hadc);
+            HAL_ADC_Start_DMA(hadc, (uint32_t*)adcDmaBufferA, ADC_BLOCK_SAMPLES);
+            currentDmaBuffer = 0;
         }
+        dmaBlockCnt++;
         dmaIrqCount++;
     }
 }
 
 // ============================================
-// ПРЕРЫВАНИЕ DIO1
+// DIO1 ISR
 // ============================================
 void onDio1Interrupt(void) {
-    radioActionDone = true; 
+    radioActionDone = true;
+    radioActionInProgress = false;
+    txDio1Interrupts++;
 }
 
 // ============================================
-// ШИМ ВЫВОД — JITTER BUFFER
+// PWM ISR
 // ============================================
 void rxPwmISR(void) {
-    if (!isTransmitting) {
-        if (!pcmStarted && pcmAvailable() >= PCM_START_THRESHOLD) {
-            pcmStarted = true;
-            Serial.println("[PWM] JITTER STARTED!");
-        }
-        
-        int16_t sample = 0;
-        if (pcmStarted && pcmPop(&sample)) {
-            // Нормальное воспроизведение
-        } else {
-            sample = 0;  // Тишина
-        }
-        
-        int32_t v = (int32_t)sample + 32768;
-        if (v < 0) v = 0;
-        if (v > 65535) v = 65535;
-        TIM1->CCR1 = ((uint32_t)v * (TIM1->ARR + 1)) >> 16;
+    TIM2->SR &= ~TIM_SR_UIF;
+    
+    uint16_t avail = pcmAvailable();
+    
+    if (!pcmStarted && avail >= PCM_START_THRESHOLD) {
+        pcmStarted = true;
     }
+    
+    // ✅ СБРОС ПРИ ОПУСТОШЕНИИ
+    if (pcmStarted && avail == 0) {
+        pcmStarted = false;
+    }
+    
+    int16_t sample = 0;
+    if (pcmStarted && pcmPop(&sample)) {
+        // OK
+    } else {
+        sample = 0;
+    }
+    
+    uint32_t pwmValue = ((uint32_t)(sample + 32768) * 4095) >> 16;
+    TIM1->CCR1 = pwmValue;
 }
 
 // ============================================
-// ИНИЦИАЛИЗАЦИЯ АЦП
+// ADC INIT
 // ============================================
 void initHardwareAdcTimerDriven() {
     __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -349,10 +314,10 @@ void initHardwareAdcTimerDriven() {
     hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
     hadc1.Init.Resolution = ADC_RESOLUTION_12B;
     hadc1.Init.ScanConvMode = DISABLE;
-    hadc1.Init.ContinuousConvMode = DISABLE; 
+    hadc1.Init.ContinuousConvMode = DISABLE;
     hadc1.Init.DiscontinuousConvMode = DISABLE;
-    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING; 
-    hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T3_TRGO;       
+    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+    hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T3_TRGO;
     hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
     hadc1.Init.NbrOfConversion = 1;
     hadc1.Init.DMAContinuousRequests = ENABLE;
@@ -360,7 +325,7 @@ void initHardwareAdcTimerDriven() {
     HAL_ADC_Init(&hadc1);
 
     ADC_ChannelConfTypeDef sConfig = {0};
-    sConfig.Channel = ADC_CHANNEL_9; 
+    sConfig.Channel = ADC_CHANNEL_9;
     sConfig.Rank = 1;
     sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
     HAL_ADC_ConfigChannel(&hadc1, &sConfig);
@@ -370,9 +335,9 @@ void initHardwareAdcTimerDriven() {
     HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 2, 0);
     HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcBlocks[0].data, ADC_BLOCK_SAMPLES);
-    blockWriteIdx = 1;
-    adcBufferReady = false;
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcDmaBufferA, ADC_BLOCK_SAMPLES);
+    currentDmaBuffer = 0;
+    readyBuffer = 0xFF;
 
     HardwareTimer *adcTimer = new HardwareTimer(TIM3);
     adcTimer->setOverflow(8000, HERTZ_FORMAT);
@@ -384,37 +349,72 @@ void initHardwareAdcTimerDriven() {
 }
 
 // ============================================
-// ОБРАБОТКА БЛОКА АЦП
+// ОБРАБОТКА БЛОКА АЦП — С ДОБАВЛЕНИЕМ SEQUENCE
 // ============================================
-void processAdcBlock(AdcBlock* block) {
-    if (block == NULL) return;
+void processAdcBlock(int16_t* data, uint32_t size) {
+    if (data == NULL) return;
     
     static int32_t dcOffset = 1800; 
     static int txFrameCounter = 0;
     
-    for (int i = 0; i < ADC_BLOCK_SAMPLES; i++) {
-        uint16_t rawAdc = block->data[i];
-        
+    for (uint32_t i = 0; i < size; i++) {
+        uint16_t rawAdc = data[i];
         dcOffset = (dcOffset * 15 + rawAdc) / 16; 
-
         int32_t sample32 = ((int32_t)rawAdc - dcOffset) * 12; 
-        
         if (sample32 > 32767)  sample32 = 32767;
         if (sample32 < -32768) sample32 = -32768;
-        
         audioBuffer[i] = (int16_t)sample32;
         adcReadCount++;
     }
 
     framesEncoded++;
-
-    uint8_t* dest = txPacketBuffer + (txFrameCounter * bytesPerFrame);
+    
+    // ✅ КОДИРУЕМ ПОСЛЕ 2-БАЙТОВОГО ЗАГОЛОВКА
+    uint8_t* dest = txPacketBuffer + PACKET_HEADER_SIZE +
+                    (txFrameCounter * bytesPerFrame);
     codec2_encode(c2, dest, audioBuffer);
     txFrameCounter++;
 
     if (txFrameCounter >= FRAMES_PER_PACKET) {
         txFrameCounter = 0;
-        txQueuePush(txPacketBuffer, packetSize);
+        
+        // ✅ ДОБАВЛЯЕМ SEQUENCE В НАЧАЛО ПАКЕТА
+        txPacketBuffer[0] = txSequence & 0xFF;
+        txPacketBuffer[1] = (txSequence >> 8) & 0xFF;
+        txSequence++;
+        
+        if (!txQueuePush(txPacketBuffer, radioPacketSize)) {
+            txQueueFullCount++;
+        }
+    }
+}
+
+// ============================================
+// DMA READY BLOCKS
+// ============================================
+void handleDmaReadyBlocks() {
+    if (readyBuffer != 0xFF) {
+        int16_t* bufferData;
+        if (readyBuffer == 0) {
+            bufferData = adcDmaBufferA;
+        } else {
+            bufferData = adcDmaBufferB;
+        }
+        
+        AdcBlock* block = &adcBlocks[blockWriteIdx];
+        memcpy(block->data, bufferData, ADC_BLOCK_SAMPLES * sizeof(int16_t));
+        block->timestamp = micros();
+        block->sequence = blockSequence++;
+        
+        blockWriteIdx = (blockWriteIdx + 1) % NUM_ADC_BLOCKS;
+        blocksAvailable++;
+        
+        if (blocksAvailable >= NUM_ADC_BLOCKS) {
+            blocksLost++;
+            blockReadIdx = (blockReadIdx + 1) % NUM_ADC_BLOCKS;
+            blocksAvailable--;
+        }
+        readyBuffer = 0xFF;
     }
 }
 
@@ -422,152 +422,123 @@ void processAdcBlock(AdcBlock* block) {
 // ПЕРЕДАЧА
 // ============================================
 void processTransmit() {
-    if (txCount == 0) return;
-    if (radioActionInProgress) return;
+    static uint32_t timeoutStart = 0;
+    
+    if (txCount == 0) {
+        timeoutStart = 0;
+        return;
+    }
+    
+    if (radioActionInProgress) {
+        if (timeoutStart == 0) timeoutStart = millis();
+        if (millis() - timeoutStart > 300) {
+            Serial.println("[TX_ERR] Timeout! Resetting...");
+            radioActionInProgress = false;
+            timeoutStart = 0;
+            txTimeoutResets++;
+            radio.standby();
+        }
+        return;
+    }
+    
+    timeoutStart = 0;
     if (!radioReady) return;
     
     uint8_t data[32];
     uint8_t len;
     if (txQueuePop(data, &len)) {
         radioActionInProgress = true;
+        txStartTransmitCalls++;
+        
         int state = radio.startTransmit(data, len);
+        
         if (state == RADIOLIB_ERR_NONE) {
             packetsSent++;
             txPacketCnt++;
+            txStartTransmitSuccess++;
+            timeoutStart = 0;
         } else {
             radioActionInProgress = false;
             txPacketLost++;
-            if (txPacketLost % 5 == 0) {
-                Serial.print("[TX_ERR] ");
-                Serial.println(state);
-            }
+            txStartTransmitFail++;
+            timeoutStart = 0;
         }
     }
 }
 
 // ============================================
-// ОБРАБОТКА ОЧЕРЕДИ БЛОКОВ
+// ГОЛОС ПРИ ПЕРЕДАЧЕ
 // ============================================
 void handleVoiceTransmit() {
-    if (adcBufferReady) {
-        adcBufferReady = false;
-        
-        if (blocksAvailable >= NUM_ADC_BLOCKS) {
-            blocksLost++;
-            blocksAvailable = 0;
-            blockReadIdx = blockWriteIdx;
-        }
-        
-        uint8_t readyBlock = blockWriteIdx;
-        blockWriteIdx = (blockWriteIdx + 1) % NUM_ADC_BLOCKS;
-        
-        adcBlocks[readyBlock].timestamp = micros();
-        adcBlocks[readyBlock].sequence = blockSequence++;
-        blocksAvailable++;
-    }
-    
     while (blocksAvailable > 0) {
         blocksAvailable--;
         AdcBlock* block = &adcBlocks[blockReadIdx];
         blockReadIdx = (blockReadIdx + 1) % NUM_ADC_BLOCKS;
-        processAdcBlock(block);
+        processAdcBlock(block->data, ADC_BLOCK_SAMPLES);
     }
 }
 
 // ============================================
-// ОБРАБОТКА RX ПАКЕТОВ (из очереди в reorder)
-// ============================================
-void processRxQueue() {
-    uint8_t data[32];
-    uint8_t len;
-    uint16_t seq;
-    
-    while (rxCount > 0) {
-        if (rxQueuePop(data, &len, &seq)) {
-            bool success = reorderPush(data, len, seq);
-            if (!success) {
-                // Слот занят — потеря пакета
-                static uint32_t reorderFull = 0;
-                reorderFull++;
-                if (reorderFull % 10 == 0) {
-                    Serial.print("[REORDER] Slot busy, lost: ");
-                    Serial.println(reorderFull);
-                }
-            }
-        }
-    }
-}
-
-// ============================================
-// ОБРАБОТКА REORDER (в правильном порядке)
-// ============================================
-void processReorder() {
-    uint8_t data[32];
-    uint8_t len;
-    static uint32_t decodedPackets = 0;
-    static uint32_t lastLogTime = 0;
-    uint32_t decodedThisCall = 0;
-    
-    while (reorderPop(data, &len)) {
-        decodedThisCall++;
-        decodedPackets++;
-        
-        // Декодируем все кадры в пакете
-        for (int f = 0; f < FRAMES_PER_PACKET; f++) {
-            uint8_t* framePtr = data + (f * bytesPerFrame);
-            codec2_decode(c2, audioBuffer, framePtr);
-            
-            for (int i = 0; i < samplesPerFrame; i++) {
-                pcmPush(audioBuffer[i]);
-            }
-        }
-    }
-    
-    // Логирование каждую секунду
-    if (millis() - lastLogTime > 1000) {
-        lastLogTime = millis();
-        if (decodedPackets > 0) {
-            Serial.print("[REORDER] Decoded: ");
-            Serial.print(decodedPackets);
-            Serial.print(" total, JITTER: ");
-            Serial.print(pcmAvailable());
-            Serial.print("/");
-            Serial.println(PCM_JITTER_SIZE);
-        }
-    }
-}
-
-// ============================================
-// ПРИЕМ ПАКЕТОВ
+// ПРИЕМ ПАКЕТОВ — ЧИТАЕМ SEQUENCE, ДЕКОДИРУЕМ АУДИО
 // ============================================
 void processIncomingPacket() {
     if (!radioActionDone) return;
+    
+    if (radioActionInProgress) {
+        radioActionInProgress = false;
+    }
+    
+    if (isTransmitting) {
+        radioActionDone = false;
+        return;
+    }
+    
     radioActionDone = false;
     
-    int state = radio.readData(rxPacketBuffer, packetSize);
+    // ✅ ЧИТАЕМ РАДИОПАКЕТ (16 БАЙТ)
+    int state = radio.readData(rxPacketBuffer, radioPacketSize);
     
     if (state == RADIOLIB_ERR_NONE) {
         rxPacketsReceived++;
         lastPacketRssi = radio.getRSSI();
         
-        // ✅ ИСПРАВЛЕНО: используем rxSequence для нумерации принятых пакетов
-        rxQueuePush(rxPacketBuffer, packetSize, rxSequence);
-        rxSequence++;  // ← Увеличиваем счетчик RX
+        // ✅ ЧИТАЕМ SEQUENCE
+        uint16_t seq = rxPacketBuffer[0] | (rxPacketBuffer[1] << 8);
+        
+        static uint32_t lastDebug = 0;
+        if (millis() - lastDebug > 2000) {
+            lastDebug = millis();
+            Serial.print("[RX_DBG] Seq=");
+            Serial.println(seq);
+        }
+        
+        // ✅ ДЕКОДИРУЕМ ТОЛЬКО АУДИОДАННЫЕ (ПОСЛЕ 2-БАЙТОВОГО ЗАГОЛОВКА)
+        uint8_t* audioData = rxPacketBuffer + PACKET_HEADER_SIZE;
+        
+        for (int f = 0; f < FRAMES_PER_PACKET; f++) {
+            uint8_t* framePtr = audioData + (f * bytesPerFrame);
+            codec2_decode(c2, audioBuffer, framePtr);
+            
+            if (f == 0) {
+                plcSaveFrame(audioBuffer, samplesPerFrame);
+            }
+            
+            for (int i = 0; i < samplesPerFrame; i++) {
+                pcmPush(audioBuffer[i]);
+            }
+        }
         
         if (rxPacketsReceived % 10 == 0) {
             Serial.print("[RX] ");
             Serial.print(rxPacketsReceived);
-            Serial.print(" | RSSI:");
+            Serial.print(" RSSI:");
             Serial.print(lastPacketRssi, 1);
-            Serial.print(" | JITTER:");
-            Serial.print(pcmAvailable());
-            Serial.print("/");
-            Serial.println(PCM_JITTER_SIZE);
+            Serial.print(" JITTER:");
+            Serial.println(pcmAvailable());
         }
-
     } else {
         rxPacketsFailed++;
-        if (rxPacketsFailed % 5 == 0) {
+        if (rxPacketsFailed % 10 == 0) {
             Serial.print("[RX_ERR] ");
             Serial.println(state);
         }
@@ -578,34 +549,97 @@ void processIncomingPacket() {
 }
 
 // ============================================
-// ДИАГНОСТИКА
+// PWM INIT — ИСПРАВЛЕН ARR = 4095
+// ============================================
+void initPwmAudio() {
+    __HAL_RCC_TIM1_CLK_ENABLE();
+    
+    GPIO_InitTypeDef gpioInit = {0};
+    gpioInit.Pin = GPIO_PIN_8;
+    gpioInit.Mode = GPIO_MODE_AF_PP;
+    gpioInit.Pull = GPIO_NOPULL;
+    gpioInit.Speed = GPIO_SPEED_FREQ_LOW;
+    gpioInit.Alternate = GPIO_AF1_TIM1;
+    HAL_GPIO_Init(GPIOA, &gpioInit);
+    
+    TIM_HandleTypeDef htim1 = {0};
+    htim1.Instance = TIM1;
+    htim1.Init.Prescaler = 0;
+    htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim1.Init.Period = 4095;   // ✅ БЫЛО 419 — ИСПРАВЛЕНО!
+    htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim1.Init.RepetitionCounter = 0;
+    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    HAL_TIM_PWM_Init(&htim1);
+    
+    TIM_OC_InitTypeDef ocConfig = {0};
+    ocConfig.OCMode = TIM_OCMODE_PWM1;
+    ocConfig.Pulse = 2048;    // ✅ ЦЕНТР (тишина)
+    ocConfig.OCPolarity = TIM_OCPOLARITY_HIGH;
+    ocConfig.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+    ocConfig.OCFastMode = TIM_OCFAST_DISABLE;
+    ocConfig.OCIdleState = TIM_OCIDLESTATE_RESET;
+    ocConfig.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+    HAL_TIM_PWM_ConfigChannel(&htim1, &ocConfig, TIM_CHANNEL_1);
+    
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+}
+
+// ============================================
+// ДИАГНОСТИКА — ПРОСТОЙ ФОРМАТ
 // ============================================
 void printDiag() {
-    Serial.println("\n=== DIAG ===");
-    Serial.print("DMA blocks:"); Serial.print(dmaBlockCnt);
-    Serial.print(" | Q blocks:"); Serial.print(blocksAvailable);
-    Serial.print(" lost:"); Serial.print(blocksLost);
-    Serial.print(" | TX:"); Serial.print(txPacketCnt);
-    Serial.print(" lost:"); Serial.print(txPacketLost);
-    Serial.print(" | Q:"); Serial.print(txCount);
-    Serial.print("/"); Serial.println(TX_QUEUE_SIZE);
+    static uint32_t lastPrint = 0;
+    if (millis() - lastPrint < 1000) return;
+    lastPrint = millis();
     
-    Serial.print("RX:"); Serial.print(rxPacketsReceived);
-    Serial.print(" err:"); Serial.print(rxPacketsFailed);
-    Serial.print(" | RXseq:"); Serial.print(rxSequence);
-    Serial.print(" | ReorderNext:"); Serial.print(reorderNextSeq);
-    Serial.print(" | Lost:"); Serial.print(reorderLost);
-    Serial.println();
+    Serial.print("DMA:");
+    Serial.print(dmaBlockCnt);
+    Serial.print(" Blk:");
+    Serial.print(blocksAvailable);
+    Serial.print("/");
+    Serial.print(NUM_ADC_BLOCKS);
+    Serial.print(" lost:");
+    Serial.print(blocksLost);
     
-    Serial.print("JITTER:"); Serial.print(pcmAvailable());
-    Serial.print("/"); Serial.print(PCM_JITTER_SIZE);
-    Serial.print(" | underrun:"); Serial.print(pcmUnderrun);
-    Serial.print(" overrun:"); Serial.println(pcmOverrun);
+    Serial.print(" | TX:");
+    Serial.print(txPacketCnt);
+    Serial.print(" Q:");
+    Serial.print(txCount);
+    Serial.print("/");
+    Serial.print(TX_QUEUE_SIZE);
     
-    Serial.print("RX Queue:"); Serial.print(rxCount);
-    Serial.print("/"); Serial.print(RX_QUEUE_SIZE);
-    Serial.print(" lost:"); Serial.println(rxQueueLost);
-    Serial.println("============");
+    Serial.print(" | TXcalls:");
+    Serial.print(txStartTransmitCalls);
+    Serial.print(" OK:");
+    Serial.print(txStartTransmitSuccess);
+    Serial.print(" Fail:");
+    Serial.print(txStartTransmitFail);
+    Serial.print(" TO:");
+    Serial.print(txTimeoutResets);
+    
+    Serial.print(" | RX:");
+    Serial.print(rxPacketsReceived);
+    Serial.print(" err:");
+    Serial.print(rxPacketsFailed);
+    Serial.print(" DIO1:");
+    Serial.print(txDio1Interrupts);
+    
+    Serial.print(" | JIT:");
+    Serial.print(pcmAvailable());
+    Serial.print("/");
+    Serial.print(PCM_JITTER_SIZE);
+    Serial.print(" ur:");
+    Serial.print(pcmUnderrun);
+    Serial.print(" or:");
+    Serial.print(pcmOverrun);
+    
+    Serial.print(" | ");
+    Serial.print(isTransmitting ? "TX" : "RX");
+    Serial.print(" radio:");
+    Serial.print(radioReady ? "Y" : "N");
+    Serial.print(" pcm:");
+    Serial.println(pcmStarted ? "Y" : "N");
 }
 
 // ============================================
@@ -618,7 +652,10 @@ void setup() {
     pinMode(PIN_PTT, INPUT_PULLUP);
     digitalWrite(PIN_LED, HIGH);
 
+    Serial.println("\n=== SYSTEM INIT ===");
+
     initAudioCodec();
+    initPwmAudio();           // ✅ ТОЛЬКО ЗДЕСЬ
     initHardwareAdcTimerDriven();
     initRadioHardware();
 
@@ -626,6 +663,9 @@ void setup() {
         radio.setDio1Action(onDio1Interrupt);
         HAL_NVIC_SetPriority(EXTI0_IRQn, 3, 0);
         HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+        Serial.println("[INIT] Radio OK");
+    } else {
+        Serial.println("[INIT] Radio FAIL");
     }
 
     rxPwmTimer8k = new HardwareTimer(TIM2);
@@ -635,14 +675,6 @@ void setup() {
 
     HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(TIM2_IRQn);
-    
-    // === ИНИЦИАЛИЗАЦИЯ ===
-    blockWriteIdx = 1;
-    blockReadIdx = 0;
-    blocksAvailable = 0;
-    blockSequence = 0;
-    blocksLost = 0;
-    adcBufferReady = false;
     
     pcmWrite = 0;
     pcmRead = 0;
@@ -655,23 +687,38 @@ void setup() {
     txCount = 0;
     txLost = 0;
     
-    rxHead = 0;
-    rxTail = 0;
-    rxCount = 0;
-    rxQueueLost = 0;
-    txSequence = 0;
-    rxSequence = 0;  // ← Инициализация нового счетчика
-    reorderNextSeq = 0;
+    txSequence = 0;   // ✅ ИНИЦИАЛИЗАЦИЯ SEQUENCE
     
-    for (int i = 0; i < REORDER_SIZE; i++) {
-        reorderBuffer[i].ready = false;
-    }
+    currentDmaBuffer = 0;
+    readyBuffer = 0xFF;
+    dmaBlockCnt = 0;
+    blocksAvailable = 0;
+    blockWriteIdx = 0;
+    blockReadIdx = 0;
     
-    Serial.println("\n=== SYSTEM READY ===");
-    Serial.print("PCM_JITTER_SIZE: "); Serial.println(PCM_JITTER_SIZE);
-    Serial.print("PCM_START_THRESHOLD: "); Serial.println(PCM_START_THRESHOLD);
-    Serial.print("FRAMES_PER_PACKET: "); Serial.println(FRAMES_PER_PACKET);
-    Serial.print("Packet size: "); Serial.println(packetSize);
+    lastFrameValid = false;
+    plcFade = 1.0;
+    
+    txQueueFullCount = 0;
+    txStartTransmitCalls = 0;
+    txStartTransmitSuccess = 0;
+    txStartTransmitFail = 0;
+    txDio1Interrupts = 0;
+    txTimeoutResets = 0;
+    
+    Serial.println("=== READY ===");
+    Serial.print("ADC:");
+    Serial.print(ADC_BLOCK_SAMPLES);
+    Serial.print(" JIT:");
+    Serial.print(PCM_JITTER_SIZE);
+    Serial.print(" START:");
+    Serial.print(PCM_START_THRESHOLD);
+    Serial.print(" TXQ:");
+    Serial.print(TX_QUEUE_SIZE);
+    Serial.print(" radioPkt:");
+    Serial.println(radioPacketSize);
+    Serial.println("PTT -> TX, release -> RX");
+    Serial.println();
 }
 
 // ============================================
@@ -682,47 +729,29 @@ void loop() {
 
     if (pttPressed && !isTransmitting) {
         isTransmitting = true;
-        digitalWrite(PIN_LED, LOW); 
+        digitalWrite(PIN_LED, LOW);
         
         framesEncoded = 0;
         packetsSent = 0;
         adcReadCount = 0;
-        dmaIrqCount = 0;
-        dmaBlockCnt = 0;
-        blocksLost = 0;
-        blocksAvailable = 0;
-        blockSequence = 0;
-        adcBufferReady = false;
+        txPacketCnt = 0;
+        txPacketLost = 0;
         
         txHead = 0;
         txTail = 0;
         txCount = 0;
         txLost = 0;
-
-        pcmWrite = 0;
-        pcmRead = 0;
-        pcmStarted = false;
-        pcmUnderrun = 0;
-        pcmOverrun = 0;
-
-        rxHead = 0;
-        rxTail = 0;
-        rxCount = 0;
-        rxQueueLost = 0;
-        txSequence = 0;
-        rxSequence = 0;      // ← Сброс счетчика RX
-        reorderNextSeq = 0;
-        reorderLost = 0;
+        txQueueFullCount = 0;
+        txStartTransmitCalls = 0;
+        txStartTransmitSuccess = 0;
+        txStartTransmitFail = 0;
+        txDio1Interrupts = 0;
+        txTimeoutResets = 0;
         
-        for (int i = 0; i < REORDER_SIZE; i++) {
-            reorderBuffer[i].ready = false;
-        }
+        txSequence = 0;   // ✅ СБРОС SEQUENCE
         
         rxPacketsReceived = 0;
         rxPacketsFailed = 0;
-        rxIntervalMax = 0;
-        rxIntervalMin = 99999;
-        bufferEmptyEvents = 0;
 
         radioActionDone = false; 
         radioActionInProgress = false; 
@@ -730,11 +759,11 @@ void loop() {
         setTxenRxen(true, false);
         delayMicroseconds(50);
         
-        Serial.println("[MODE] TX START");
+        Serial.println("\n[MODE] TX START");
     } 
     else if (!pttPressed && isTransmitting) {
         isTransmitting = false;
-        digitalWrite(PIN_LED, HIGH); 
+        digitalWrite(PIN_LED, HIGH);
 
         uint32_t waitStart = millis();
         while (txCount > 0 && (millis() - waitStart < 500)) {
@@ -749,28 +778,22 @@ void loop() {
         setTxenRxen(false, true);
         radio.startReceive();
 
-        printDiag();
         Serial.println("[MODE] RX START");
     }
 
-    // === ОБРАБОТКА ПРИЕМА ===
+    handleDmaReadyBlocks();
+
     if (radioActionDone) {
-        processIncomingPacket();  // 1. Принимаем → в RX_QUEUE
+        processIncomingPacket();
+    }
+
+    if (isTransmitting) {
+        handleVoiceTransmit();
+        processTransmit();
     }
     
-    processRxQueue();            // 2. RX_QUEUE → REORDER
-    processReorder();            // 3. REORDER → JITTER BUFFER
-
-    // === ОБРАБОТКА ПЕРЕДАЧИ ===
-    if (isTransmitting) {
-        handleVoiceTransmit();   // 4. ADC → CODEC2 → TX_QUEUE
-        processTransmit();       // 5. TX_QUEUE → RADIO
-    }
+    printDiag();
 }
-
-
-
-
 
 
 
@@ -792,6 +815,10 @@ void loop() {
 
 // ЖЕСТКАЯ ФИКСАЦИЯ: 2 кадра = 40 мс звука
 #define FRAMES_PER_PACKET 2
+
+// ✅ РАЗМЕР ЗАГОЛОВКА ПАКЕТА (2 байта sequence)
+#define PACKET_HEADER_SIZE 2
+
 // ==================== БУФЕРЫ ПЕРИФЕРИИ ====================
 #define ADC_BUFFER_SIZE 640
 
@@ -816,7 +843,8 @@ extern HardwareTimer *pwmTimer;
 extern struct CODEC2 *c2;
 extern int samplesPerFrame;
 extern int bytesPerFrame;
-extern int packetSize;           
+extern int packetSize;           // Размер аудиоданных (14 байт)
+extern int radioPacketSize;      // Размер радиопакета (16 байт = 2 + 14)
 
 extern int16_t*  audioBuffer;    
 extern uint8_t*  txPacketBuffer; 
@@ -830,28 +858,8 @@ extern volatile uint32_t dmaIrqCount;
 extern ADC_HandleTypeDef hadc1;
 extern DMA_HandleTypeDef hdma_adc1;
 
-// ==================== PWM ВЫВОД ЗВУКА ====================
-inline void initAudioOut() {
-    Serial.println(F("    [PWM] Start..."));
-    pinMode(AUDIO_OUT_PIN, OUTPUT);
-    pwmTimer = new HardwareTimer(TIM1);
-    pwmTimer->setMode(1, TIMER_OUTPUT_COMPARE_PWM1, AUDIO_OUT_PIN);
-    
-    // ✅ ПРАВИЛЬНАЯ НАСТРОЙКА PWM
-    // 200 кГц несущая, 16-битная точность
-    pwmTimer->setOverflow(200000, HERTZ_FORMAT);
-    pwmTimer->setCaptureCompare(1, 0, PERCENT_COMPARE_FORMAT);
-    pwmTimer->resume();
-    Serial.println(F("    [PWM] OK"));
-}
-
-inline void audioOutWrite(uint8_t pwmValue) {
-    if (pwmTimer == NULL) return;
-    if (pwmValue > 100) pwmValue = 100;
-    pwmTimer->setCaptureCompare(1, pwmValue, PERCENT_COMPARE_FORMAT);
-}
-
 // ==================== ИНИЦИАЛИЗАЦИЯ КОДЕКА ====================
+// ✅ УБРАНА инициализация PWM! Только Codec2 и буферы.
 inline void initAudioCodec() {
     Serial.println(F("\n[initAudioCodec] START"));
     
@@ -866,16 +874,18 @@ inline void initAudioCodec() {
     samplesPerFrame = codec2_samples_per_frame(c2);
     bytesPerFrame = getCodec2BytesPerFrame(CODEC2_MODE);
     packetSize = bytesPerFrame * FRAMES_PER_PACKET;
+    radioPacketSize = packetSize + PACKET_HEADER_SIZE;
 
     Serial.print(F("    samplesPerFrame: ")); Serial.println(samplesPerFrame);
     Serial.print(F("    bytesPerFrame: ")); Serial.println(bytesPerFrame);
     Serial.print(F("    packetSize: ")); Serial.println(packetSize);
+    Serial.print(F("    radioPacketSize: ")); Serial.println(radioPacketSize);
     Serial.print(F("    FRAMES_PER_PACKET: ")); Serial.println(FRAMES_PER_PACKET);
 
     Serial.print(F("  malloc buffers..."));
     audioBuffer = (int16_t*)malloc(samplesPerFrame * sizeof(int16_t));
-    txPacketBuffer = (uint8_t*)malloc(packetSize);
-    rxPacketBuffer = (uint8_t*)malloc(packetSize);
+    txPacketBuffer = (uint8_t*)malloc(radioPacketSize);
+    rxPacketBuffer = (uint8_t*)malloc(radioPacketSize);
     if (audioBuffer && txPacketBuffer && rxPacketBuffer) {
         Serial.println(F(" OK"));
     } else {
@@ -883,8 +893,8 @@ inline void initAudioCodec() {
         return;
     }
     
-    Serial.print(F("  Init PWM..."));
-    initAudioOut();
+    // ✅ НЕ ВЫЗЫВАЕМ initAudioOut() ЗДЕСЬ!
+    // PWM инициализируется только в initPwmAudio() (в main.cpp)
     
     Serial.println(F("[initAudioCodec] END"));
 }
@@ -918,10 +928,10 @@ inline void initAudioCodec() {
 // Раскомментируй нужную строку:
 // #define RADIO_BITRATE_KBPSx10  24   // 2.4 кбит/с
 //#define RADIO_BITRATE_KBPSx10  48   // 4.8 кбит/с
-// #define RADIO_BITRATE_KBPSx10  96   // 9.6 кбит/с
+#define RADIO_BITRATE_KBPSx10  96   // 9.6 кбит/с
 // #define RADIO_BITRATE_KBPSx10  192  // 19.2 кбит/с
- #define RADIO_BITRATE_KBPSx10  384  // 38.4 кбит/с
-// #define RADIO_BITRATE_KBPSx10  500  // 50.0 кбит/с
+// #define RADIO_BITRATE_KBPSx10  384  // 38.4 кбит/с
+//  #define RADIO_BITRATE_KBPSx10  500  // 50.0 кбит/с
 
 // ==================== ПАРАМЕТРЫ ДЛЯ КАЖДОЙ СКОРОСТИ ====================
 #if RADIO_BITRATE_KBPSx10 == 24
